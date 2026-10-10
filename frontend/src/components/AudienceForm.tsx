@@ -1,23 +1,16 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useCallback } from "react";
 import type {
   ConditionRow as ConditionRowType,
-  AudiencePreviewResponse,
   FormValidationError,
 } from "../types/audience";
-import { previewAudience, ApiError, NetworkError } from "../api/audienceApi";
 import { ConditionRow } from "./ConditionRow";
 import { AudienceResults } from "./AudienceResults";
+import { validateForm, buildUtcIso } from "../validation";
+import { usePreviewAudience } from "../hooks/usePreviewAudience";
 
 // Seed defaults matching test scenario
 const DEFAULT_DATE = "2026-09-29";
 const DEFAULT_TIME = "00:00";
-
-/**
- * Combines date and time strings into a UTC ISO 8601 timestamp.
- */
-function buildUtcIso(date: string, time: string): string {
-  return `${date}T${time}:00.000Z`;
-}
 
 function makeConditionId(): string {
   return `cond_${Math.random().toString(36).slice(2, 9)}`;
@@ -42,69 +35,8 @@ function makeDefaultConditions(): ConditionRowType[] {
   ];
 }
 
-// ---------------------------------------------------------------------------
-// Client Form Validation
-// ---------------------------------------------------------------------------
-
-function validateForm(
-  name: string,
-  date: string,
-  conditions: ConditionRowType[],
-): FormValidationError[] {
-  const errors: FormValidationError[] = [];
-
-  if (!name.trim()) {
-    errors.push({ field: "name", message: "Audience name is required." });
-  }
-
-  if (!date.trim()) {
-    errors.push({ field: "asOf", message: "As-of date is required." });
-  }
-
-  conditions.forEach((c, i) => {
-    if (
-      isNaN(c.count) ||
-      !Number.isInteger(c.count) ||
-      c.count < 0 ||
-      c.count > 1_000_000
-    ) {
-      errors.push({
-        field: `conditions.${i}.count`,
-        message: `Condition ${i + 1}: count must be an integer between 0 and 1,000,000.`,
-      });
-    }
-    if (
-      isNaN(c.withinDays) ||
-      !Number.isInteger(c.withinDays) ||
-      c.withinDays < 1 ||
-      c.withinDays > 365
-    ) {
-      errors.push({
-        field: `conditions.${i}.withinDays`,
-        message: `Condition ${i + 1}: within days must be an integer between 1 and 365.`,
-      });
-    }
-  });
-
-  return errors;
-}
-
-// ---------------------------------------------------------------------------
-// Component State & Types
-// ---------------------------------------------------------------------------
-
-type AppState =
-  | { kind: "idle" }
-  | { kind: "loading" }
-  | { kind: "success"; result: AudiencePreviewResponse }
-  | {
-      kind: "error";
-      message: string;
-      details?: string[];
-      isValidation: boolean;
-    };
-
 export function AudienceForm() {
+  // Local form state
   const [name, setName] = useState("Viewed but not purchased");
   const [asOfDate, setAsOfDate] = useState(DEFAULT_DATE);
   const [asOfTime, setAsOfTime] = useState(DEFAULT_TIME);
@@ -112,20 +44,10 @@ export function AudienceForm() {
     makeDefaultConditions,
   );
   const [formErrors, setFormErrors] = useState<FormValidationError[]>([]);
-  const [appState, setAppState] = useState<AppState>({ kind: "idle" });
 
-  // Cache last submitted payload for retry
-  const lastRequestRef = useRef<{
-    name: string;
-    asOf: string;
-    conditions: ConditionRowType[];
-  } | null>(null);
-
-  // Controller for request cancellation
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  // Container ref for accessibility focus management
-  const resultsSectionRef = useRef<HTMLDivElement>(null);
+  // Server state, request lifecycle, cancellation, and error handling
+  const { appState, submitPreview, retry, resultsSectionRef, isLoading } =
+    usePreviewAudience();
 
   const addCondition = useCallback(() => {
     setConditions((prev) => [
@@ -153,66 +75,6 @@ export function AudienceForm() {
     [],
   );
 
-  const submitPreview = useCallback(
-    async (
-      submittedName: string,
-      submittedAsOf: string,
-      submittedConditions: ConditionRowType[],
-    ) => {
-      abortControllerRef.current?.abort();
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-
-      setAppState({ kind: "loading" });
-      lastRequestRef.current = {
-        name: submittedName,
-        asOf: submittedAsOf,
-        conditions: submittedConditions,
-      };
-
-      try {
-        const result = await previewAudience(
-          {
-            name: submittedName,
-            asOf: submittedAsOf,
-            conditions: submittedConditions.map(({ id: _id, ...rest }) => rest),
-          },
-          controller.signal,
-        );
-        setAppState({ kind: "success", result });
-      } catch (err) {
-        if (err instanceof Error && err.name === "AbortError") return;
-
-        if (err instanceof ApiError) {
-          const details = err.body.error.details?.map(
-            (d) => `${d.path ? d.path + ": " : ""}${d.message}`,
-          );
-          setAppState({
-            kind: "error",
-            message: err.body.error.message,
-            details: details && details.length > 0 ? details : undefined,
-            isValidation: err.body.error.code === "VALIDATION_ERROR",
-          });
-        } else if (err instanceof NetworkError) {
-          setAppState({
-            kind: "error",
-            message: err.message,
-            isValidation: false,
-          });
-        } else {
-          setAppState({
-            kind: "error",
-            message: "An unexpected error occurred. Please try again.",
-            isValidation: false,
-          });
-        }
-      } finally {
-        requestAnimationFrame(() => resultsSectionRef.current?.focus());
-      }
-    },
-    [],
-  );
-
   const handlePreview = useCallback(async () => {
     const errors = validateForm(name, asOfDate, conditions);
     setFormErrors(errors);
@@ -220,16 +82,8 @@ export function AudienceForm() {
     await submitPreview(name, buildUtcIso(asOfDate, asOfTime), conditions);
   }, [name, asOfDate, asOfTime, conditions, submitPreview]);
 
-  const handleRetry = useCallback(async () => {
-    const last = lastRequestRef.current;
-    if (!last) return;
-    await submitPreview(last.name, last.asOf, last.conditions);
-  }, [submitPreview]);
-
   const fieldError = (field: string) =>
     formErrors.find((e) => e.field === field)?.message;
-
-  const isLoading = appState.kind === "loading";
 
   // Live preview of what will be sent to the API
   const utcPreview = asOfDate ? buildUtcIso(asOfDate, asOfTime || "00:00") : "";
@@ -465,7 +319,7 @@ export function AudienceForm() {
               )}
               <button
                 type="button"
-                onClick={handleRetry}
+                onClick={retry}
                 aria-label="Retry the last audience preview"
                 className="self-start rounded border border-error-bg px-4 py-1.5 text-xs font-semibold text-error transition-colors hover:bg-error-bg"
               >
